@@ -1,0 +1,16 @@
+# SSH keys — never commit
+sshKey
+sshKey.pub
+
+# Local deploy config (cached DB host — machine-specific, not for sharing)
+.deploy-config
+
+# Compiled binaries
+market-bot-linux
+market-bot
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+settings.local.json
