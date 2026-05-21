@@ -1,23 +1,25 @@
 # market-bot
 
-An automated market bot for the Dune Awakening private server exchange. It runs as a k3s Deployment on the TrueNAS VM and continuously maintains sell listings for every tradeable item in the game, repriced dynamically based on sales velocity.
+An automated market bot for the Dune Awakening private server exchange. It runs as a k3s Deployment on the TrueNAS VM and continuously maintains sell listings for every tradeable item in the game, repriced dynamically based on sales velocity. It also buys underpriced player listings to drain cheap stock from the market.
 
 ## How it works
 
-Every 5 minutes the bot:
+**Every 5 minutes** the bot checks for underpriced player listings and buys them (up to 50 per tick) at or below 1.05× the bot's own sell price.
 
-1. Loads the item catalog from `item-data.json` + `dune-item-names.json`
+**Every 30 minutes** the bot restocks and reprices its listings:
+
+1. Loads the item catalog from `item-data.json`
 2. Queries the exchange for its own existing listings (bot actor: **Revy**, actor ID looked up dynamically)
 3. Removes listings whose price has drifted from the current target
 4. Tops up any partially-depleted stacks to full `stack_max`
 5. Creates **5 listings per quality grade** for each applicable item
 6. Refreshes all order expiry times to game-time + 24 h
 
-The bot only touches its own NPC orders — player listings are never modified.
+The bot only touches its own NPC orders — player listings are never modified (only purchased if below threshold).
 
 ### Grade listings
 
-Items that can drop from overland testing stations (ecolabs) are listed at **each of grades 0–5**, for 30 listings per item. Grade eligibility is determined by the `is_gradeable` flag in `item-data.json`, which is computed from CDT_BaseItems item tags during the `build-item-data.sh` pipeline — any non-schematic, non-resource item with a `LootTier.*` tag is considered gradeable.
+Items that can drop from overland testing stations (ecolabs) are listed at **each of grades 0–5**, for 30 listings per item. Grade eligibility is determined by the `is_gradeable` flag in `item-data.json` — any non-schematic, non-resource item with a `LootTier.*` tag is considered gradeable.
 
 Items without a `LootTier` tag (crafted-only, story-progression) are listed at **grade 0 only**, 5 listings. Schematics and stackable materials are always grade 0 only.
 
@@ -39,7 +41,7 @@ Prices adjust ±5–10 % per tick based on how much of each item sold. Floor = b
 |---------|-------|
 | Exchange | HarkoVillage\_EX (ID 2) |
 | Access point | HarkoVillage\_AP (ID 1) |
-| Bot character | Revy (class `Revy`, actor ID **varies per server** — looked up dynamically via `SELECT id FROM dune.actors WHERE class = 'Revy'`) |
+| Bot character | Revy (class `Revy`, actor ID **varies per server** — looked up dynamically) |
 | Listings per gradeable item | 5 per grade × 6 grades (0–5) = 30 total |
 | Listings per non-gradeable item | 5 (grade 0 only) |
 | Order expiry | 24 h (game time) |
@@ -50,10 +52,10 @@ Prices adjust ±5–10 % per tick based on how much of each item sold. Floor = b
 
 ```
 your machine
-  └─ deploy.sh
+  └─ deploy.sh / deploy.ps1
        ├─ cross-compiles market-bot-linux (GOOS=linux GOARCH=amd64)
        ├─ scp → VM /opt/market-bot/bin/market-bot
-       ├─ scp → VM /opt/market-bot/data/{item-data,dune-item-names}.json
+       ├─ scp → VM /opt/market-bot/data/item-data.json
        └─ kubectl apply + rollout restart
 
 TrueNAS VM (k3s)
@@ -64,7 +66,7 @@ TrueNAS VM (k3s)
             └─ connects to PostgreSQL in funcom-seabass-* namespace
 ```
 
-The bot runs entirely inside the cluster. `deploy.sh` only needs SSH access to the VM to upload files — it does not need direct database access.
+The bot runs entirely inside the cluster. The deploy scripts only need SSH access to the VM to upload files — no direct database access required from your machine.
 
 ---
 
@@ -73,20 +75,27 @@ The bot runs entirely inside the cluster. `deploy.sh` only needs SSH access to t
 | Tool | Version | Notes |
 |------|---------|-------|
 | Go | 1.21+ | Required for building locally |
-| SSH key | — | Pre-installed on VM; auto-detected by `deploy.sh` |
-| VM access | port 22 | To run `deploy.sh` |
+| SSH key | — | Auto-detected by deploy scripts (see below) |
+| VM access | port 22 | Required for deploy |
 | k3s cluster | running | Must have the Dune server Deployment active |
-| VM OS | Alpine Linux | The target VM runs Alpine — `openssh-sftp-server` must be installed (see below) |
+| VM OS | Alpine Linux | `openssh-sftp-server` must be installed (see First-time deploy) |
 
 ### SSH key
 
-`deploy.sh` reads the key from `<repo-root>/sshKey` (one directory above `market-bot/`). This file is gitignored and managed separately per deployment.
+The deploy scripts search for an SSH key in this order:
+
+1. `./sshKey` (repo root — gitignored)
+2. `~/.ssh/dune`
+3. `~/.ssh/id_ed25519`
+4. `~/.ssh/id_rsa`
+
+You can also set `SSH_KEY=/path/to/key` in `.deploy-config` or as an environment variable.
 
 ---
 
 ## Item data
 
-`dune-admin/item-data.json` and `dune-admin/dune-item-names.json` are committed to the repository. `deploy.sh` uploads them to the VM automatically — no extra steps needed.
+`item-data.json` is committed to the repository. The deploy scripts upload it to the VM automatically — no extra steps needed.
 
 ---
 
@@ -94,85 +103,75 @@ The bot runs entirely inside the cluster. `deploy.sh` only needs SSH access to t
 
 All platforms require Go 1.21+. The binary is always cross-compiled for Linux/amd64 since it runs on the TrueNAS VM.
 
-### macOS
+### macOS / Linux
 
 ```bash
-brew install go   # if not already installed
-
-cd market-bot
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o market-bot-linux .
-```
-
-### Linux (Ubuntu/Debian)
-
-```bash
-sudo apt-get update && sudo apt-get install -y golang-go
-
-cd market-bot
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o market-bot-linux .
 ```
 
 ### Windows
 
 ```powershell
-# Install Go from https://go.dev/dl/
-cd market-bot
 $env:GOOS="linux"; $env:GOARCH="amd64"; $env:CGO_ENABLED="0"
 go build -trimpath -ldflags="-s -w" -o market-bot-linux .
 ```
+
+The deploy scripts run the build automatically — you rarely need to build manually.
 
 ---
 
 ## Deploying
 
+### First run — setup wizard
+
+On the first run (or when `.deploy-config` is missing credentials) the script launches an interactive setup wizard that:
+
+1. Finds or prompts for the SSH key
+2. Prompts for the VM IP (auto-detects via Hyper-V on Windows)
+3. Verifies the SSH connection
+4. Discovers the DB host from the k3s service list
+5. Lists battlegroups via `battlegroup list` on the VM and reads the application credentials from `~/.dune/<battlegroup>.yaml`
+6. Saves everything to `.deploy-config` (gitignored)
+
+You can re-run the wizard at any time:
+
+```bash
+./deploy.sh --setup     # macOS / Linux
+.\deploy.ps1 -Setup     # Windows
+```
+
 ### macOS / Linux
 
 ```bash
-cd market-bot
-bash deploy.sh
+./deploy.sh
 ```
 
-Override the target IP:
-
-```bash
-DUNE_VM_IP=10.0.0.5 bash deploy.sh
-```
-
-### Windows (Hyper-V)
-
-On Windows the server runs in a Hyper-V VM. Find its IP first:
+### Windows
 
 ```powershell
-Get-VM | Select-Object Name, @{n='IP';e={($_ | Get-VMNetworkAdapter).IPAddresses[0]}}
-```
-
-Then deploy:
-
-```powershell
-cd market-bot
-.\deploy.ps1 -VmIp 172.28.144.1
-# or set it once:
-$env:DUNE_VM_IP = "172.28.144.1"
 .\deploy.ps1
 ```
 
-`deploy.ps1` requires PowerShell 5.1+ and OpenSSH (built into Windows 10/11). No additional tools needed.
+On Windows the server typically runs in a Hyper-V VM. The setup wizard auto-detects the IP. You can also pass it explicitly:
+
+```powershell
+.\deploy.ps1 -VmIp 172.28.144.1
+```
 
 ### What the deploy scripts do
 
 Both scripts perform the same steps:
-1. Cross-compiles the bot for Linux/amd64
-2. Uploads the binary to `/opt/market-bot/bin/market-bot` on the VM (via `/tmp` to avoid permission errors)
-3. Uploads `item-data.json` and `dune-item-names.json` to `/opt/market-bot/data/`
-4. Applies the k8s manifest (`k8s/market-bot.yaml`)
-5. Rolls out the Deployment and waits for it to become ready
-6. Tails the last 40 log lines
 
-### First-time deploy
+1. Cross-compile the bot for Linux/amd64
+2. Upload the binary to `/opt/market-bot/bin/market-bot` on the VM
+3. Upload `item-data.json` to `/opt/market-bot/data/`
+4. Render a manifest with injected DB credentials and apply it via `kubectl apply`
+5. Roll out the Deployment and wait for it to become ready
+6. Tail the last 40 log lines
 
-#### VM prerequisites (Alpine Linux)
+### First-time VM setup (Alpine Linux)
 
-The target VM runs Alpine Linux. Before the first deploy, SSH in and ensure the SFTP subsystem is available — SCP will fail with `sftp-server: No such file or directory` without it:
+Before the first deploy, ensure the SFTP subsystem is available — SCP will fail without it:
 
 ```bash
 sudo apk add openssh-sftp-server
@@ -180,36 +179,34 @@ sudo sed -i 's|^#\?Subsystem sftp .*|Subsystem sftp /usr/lib/ssh/sftp-server|' /
 sudo rc-service sshd restart
 ```
 
-#### Cluster setup
-
-On a fresh VM the k3s Deployment and namespace do not yet exist. `deploy.sh` creates them via `kubectl apply`. The required directories (`/opt/market-bot/{bin,data,cache}`) are created automatically.
+The k8s namespace, Deployment, and host directories are all created automatically by the deploy script.
 
 ---
 
 ## Configuration
 
-Static defaults live in `k8s/market-bot.yaml` (ConfigMap + Secret). The deploy scripts detect the database service and PostgreSQL pod in the target cluster during deployment, read the database connection values from the pod environment, render a temporary manifest, and apply that manifest. The detected password is not written back to `k8s/market-bot.yaml`.
+Credentials and connection details are stored in `.deploy-config` (gitignored, created by `--setup`). The deploy scripts discover the DB host dynamically from the k3s service list on each run; credentials come from `.deploy-config`.
 
-You can override detection with environment variables:
+You can override any value with environment variables:
 
 ```bash
-DUNE_DB_HOST=... DUNE_DB_USER=... DUNE_DB_PASS=... bash deploy.sh
+DUNE_DB_HOST=... DUNE_DB_USER=... DUNE_DB_PASS=... ./deploy.sh
 ```
-
-`DUNE_DB_PORT` and `DUNE_DB_NAME` are optional overrides.
 
 ### All settings
 
-| Setting | Default | Where |
-|---------|---------|-------|
-| **DB host** | detected by deploy script | ConfigMap `DB_HOST` |
-| DB port | detected by deploy script, fallback `15432` | ConfigMap `DB_PORT` |
-| DB user | detected by deploy script | ConfigMap `DB_USER` |
-| DB password | detected by deploy script | Secret `DB_PASS` |
+| Setting | Default | Source |
+|---------|---------|--------|
+| DB host | detected from k3s service | `.deploy-config` / `DUNE_DB_HOST` |
+| DB port | `15432` | ConfigMap `DB_PORT` / `DUNE_DB_PORT` |
+| DB user | from battlegroup YAML | `.deploy-config` / `DUNE_DB_USER` |
+| DB password | from battlegroup YAML | `.deploy-config` / `DUNE_DB_PASS` |
 | DB name | `dune` | ConfigMap `DB_NAME` |
-| Tick interval | `5m` | ConfigMap `INTERVAL` |
+| Buy interval | `5m` | ConfigMap `BUY_INTERVAL` |
+| List interval | `30m` | ConfigMap `LIST_INTERVAL` |
+| Buy threshold | `1.05` | `-buythreshold` flag |
+| Max buys/tick | `50` | `-maxbuys` flag |
 | Item data path | `/data/item-data.json` | ConfigMap `ITEM_DATA_PATH` |
-| Names path | `/data/dune-item-names.json` | ConfigMap `ITEM_NAMES_PATH` |
 | Cache DB path | `/cache/market-bot-cache.db` | ConfigMap `CACHE_DB_PATH` |
 
 ---
@@ -217,16 +214,15 @@ DUNE_DB_HOST=... DUNE_DB_USER=... DUNE_DB_PASS=... bash deploy.sh
 ## Logs
 
 ```bash
-# Via deploy.sh (shown automatically after deploy)
-# Or directly:
-ssh -i ../sshKey dune@192.168.0.72 \
+# Shown automatically after each deploy, or directly:
+ssh -i ./sshKey dune@192.168.0.72 \
   "sudo kubectl logs -n dune-market-bot -l app=market-bot --tail=50 -f"
 ```
 
 Key log lines:
 
 ```
-market-bot catalog: 975 listable items          ← items loaded from JSON
+market-bot catalog: 1391 listable items         ← items loaded from JSON
 market-bot exchange inventory id: 1613          ← bot's exchange inventory
 market-bot bot actor id: 158 (Revy)             ← NPC actor confirmed/created
 market-bot game epoch learned: unix 1776...     ← game clock calibrated from player orders
@@ -237,42 +233,42 @@ market-bot tick: 4875 created, 0 topped up, 0 pruned, 0 errors
 
 ## Wiping bot listings
 
-To remove all bot listings from the database (e.g. before a redeploy with new prices):
+To remove all bot listings from the database (e.g. before a redeploy with new prices), the deploy script does this automatically on each run. To do it manually:
 
 ```sql
 WITH bot AS (
   SELECT id FROM dune.actors WHERE class = 'Revy' LIMIT 1
 ),
-del_so AS (
-  DELETE FROM dune.dune_exchange_sell_orders
-  WHERE order_id IN (
-    SELECT id FROM dune.dune_exchange_orders
-    WHERE owner_id = (SELECT id FROM bot) AND is_npc_order = TRUE
-  )
-),
-del_o AS (
+del_orders AS (
   DELETE FROM dune.dune_exchange_orders
   WHERE owner_id = (SELECT id FROM bot) AND is_npc_order = TRUE
   RETURNING item_id
+),
+del_items AS (
+  DELETE FROM dune.items
+  WHERE id IN (SELECT item_id FROM del_orders WHERE item_id IS NOT NULL)
+  RETURNING id
 )
-DELETE FROM dune.items WHERE id IN (SELECT item_id FROM del_o);
+SELECT
+  (SELECT COUNT(*) FROM del_orders) AS orders_deleted,
+  (SELECT COUNT(*) FROM del_items)  AS items_deleted;
 ```
 
 > **Note:** The bot's actor ID is assigned dynamically and **varies per server instance** — never hardcode it. The query above looks it up by the `Revy` class name, which is always correct.
 
 Run this from the **dune-admin** Database tab or any PostgreSQL client with access to the cluster.
 
-After wiping, also delete the SQLite cache on the VM so the bot does not reuse stale category data:
+After wiping, delete the SQLite cache on the VM so the bot does not reuse stale data:
 
 ```bash
-ssh -i ../sshKey dune@192.168.0.72 \
+ssh -i ./sshKey dune@192.168.0.72 \
   "sudo rm -f /opt/market-bot/cache/market-bot-cache.db"
 ```
 
-Then restart the bot:
+Then restart:
 
 ```bash
-ssh -i ../sshKey dune@192.168.0.72 \
+ssh -i ./sshKey dune@192.168.0.72 \
   "sudo kubectl rollout restart deployment/market-bot -n dune-market-bot"
 ```
 
@@ -281,8 +277,7 @@ ssh -i ../sshKey dune@192.168.0.72 \
 ## Tests
 
 ```bash
-cd market-bot
 go test ./...
 ```
 
-The test suite verifies the category mask encoding (category → 32-bit market filter code) for known items. Run this after any changes to `pricing.go`.
+Verifies the category mask encoding (category → 32-bit market filter code) for known items. Run after any changes to `pricing.go`.
