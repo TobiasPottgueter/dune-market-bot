@@ -27,8 +27,9 @@ func TestConfigDefaults(t *testing.T) {
 	if !cfg.Enabled {
 		t.Error("Enabled should default to true")
 	}
-	if len(cfg.GradeMultipliers) != 6 {
-		t.Errorf("GradeMultipliers want len 6 got %d", len(cfg.GradeMultipliers))
+	want := [6]float64{1.0, 1.0, 1.25, 1.5, 1.75, 2.0}
+	if cfg.GradeMultipliers != want {
+		t.Errorf("GradeMultipliers want %v got %v", want, cfg.GradeMultipliers)
 	}
 }
 
@@ -39,6 +40,20 @@ func TestConfigSnapshot(t *testing.T) {
 	snap.MaxBuys = 999
 	if c.config.MaxBuys == 999 {
 		t.Error("Snapshot should be a copy, not a reference")
+	}
+
+	// Test map isolation
+	snap2 := c.Snapshot()
+	snap2.RarityMultipliers["common"] = 99.0
+	if c.Snapshot().RarityMultipliers["common"] == 99.0 {
+		t.Error("Snapshot RarityMultipliers should be an independent copy")
+	}
+
+	// Test slice isolation
+	snap3 := c.Snapshot()
+	snap3.DisabledItems = append(snap3.DisabledItems, "extra")
+	if len(c.Snapshot().DisabledItems) != 0 {
+		t.Error("Snapshot DisabledItems should be an independent copy")
 	}
 }
 
@@ -66,5 +81,25 @@ func TestConfigValidation(t *testing.T) {
 	patch["max_buys"] = b
 	if err := c.Apply(patch); err == nil {
 		t.Error("expected error for negative MaxBuys")
+	}
+}
+
+func TestConfigValidationAtomicity(t *testing.T) {
+	c := &Config{}
+	c.config = defaultConfig()
+
+	patch := map[string]json.RawMessage{}
+	validVal, _ := json.Marshal(25)
+	patch["max_buys"] = validVal
+	invalidVal, _ := json.Marshal(-1)
+	patch["buy_threshold"] = invalidVal // invalid: negative
+
+	err := c.Apply(patch)
+	if err == nil {
+		t.Error("expected error for invalid buy_threshold")
+	}
+	// max_buys should NOT have been updated (atomicity)
+	if c.Snapshot().MaxBuys != 50 {
+		t.Errorf("Apply should be atomic: MaxBuys should still be 50, got %d", c.Snapshot().MaxBuys)
 	}
 }

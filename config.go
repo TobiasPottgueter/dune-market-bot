@@ -69,18 +69,47 @@ func (c *Config) Snapshot() configValues {
 	return snap
 }
 
-// MarshalJSON returns the current config as JSON (for GET /config).
+// configJSON is the JSON wire format — durations as strings for round-trip compatibility with Apply.
+type configJSON struct {
+	BuyInterval       string             `json:"buy_interval"`
+	ListInterval      string             `json:"list_interval"`
+	BuyThreshold      float64            `json:"buy_threshold"`
+	MaxBuys           int                `json:"max_buys"`
+	ListingsPerGrade  int                `json:"listings_per_grade"`
+	Enabled           bool               `json:"enabled"`
+	GradeMultipliers  [6]float64         `json:"grade_multipliers"`
+	RarityMultipliers map[string]float64 `json:"rarity_multipliers"`
+	VendorMultipliers map[string]float64 `json:"vendor_multipliers"`
+	DisabledItems     []string           `json:"disabled_items"`
+}
+
+// MarshalJSON returns the config as JSON with durations as strings (e.g. "5m0s"),
+// making the output round-trip compatible with Apply.
 func (c *Config) MarshalJSON() ([]byte, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return json.Marshal(c.config)
+	return json.Marshal(configJSON{
+		BuyInterval:       c.config.BuyInterval.String(),
+		ListInterval:      c.config.ListInterval.String(),
+		BuyThreshold:      c.config.BuyThreshold,
+		MaxBuys:           c.config.MaxBuys,
+		ListingsPerGrade:  c.config.ListingsPerGrade,
+		Enabled:           c.config.Enabled,
+		GradeMultipliers:  c.config.GradeMultipliers,
+		RarityMultipliers: c.config.RarityMultipliers,
+		VendorMultipliers: c.config.VendorMultipliers,
+		DisabledItems:     c.config.DisabledItems,
+	})
 }
 
 // Apply updates config fields from a partial JSON patch map.
 // Only listed keys are changed; unknown keys are ignored.
 // Returns an error if validation fails; no partial updates are applied.
 func (c *Config) Apply(patch map[string]json.RawMessage) error {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Work on a copy; only commit if all validation passes.
 	next := c.config
 	next.DisabledItems = append([]string(nil), c.config.DisabledItems...)
 	next.RarityMultipliers = make(map[string]float64, len(c.config.RarityMultipliers))
@@ -91,7 +120,6 @@ func (c *Config) Apply(patch map[string]json.RawMessage) error {
 	for k, v := range c.config.VendorMultipliers {
 		next.VendorMultipliers[k] = v
 	}
-	c.mu.RUnlock()
 
 	for key, raw := range patch {
 		switch key {
@@ -165,8 +193,6 @@ func (c *Config) Apply(patch map[string]json.RawMessage) error {
 		}
 	}
 
-	c.mu.Lock()
 	c.config = next
-	c.mu.Unlock()
 	return nil
 }
