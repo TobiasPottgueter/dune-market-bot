@@ -102,7 +102,7 @@ func loadCatalog() ([]CatalogItem, error) {
 			MaxPrice:             d.MaxPrice,
 			Buyable:              d.Buyable == nil || *d.Buyable, // default true
 		}
-		item.ListPrice = computePrice(item)
+		item.ListPrice = computePrice(item, defaultConfig())
 		catalog = append(catalog, item)
 	}
 

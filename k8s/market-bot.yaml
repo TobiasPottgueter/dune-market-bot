@@ -34,6 +34,8 @@ metadata:
 type: Opaque
 stringData:
   DB_PASS: ""
+  # !! SET THIS before deploying — shared secret for the HTTP API.
+  API_TOKEN: ""
 
 ---
 apiVersion: apps/v1
@@ -71,6 +73,24 @@ spec:
             - -cachedb=$(CACHE_DB_PATH)
             - -buyinterval=$(BUY_INTERVAL)
             - -listinterval=$(LIST_INTERVAL)
+            - -apiaddr=:8081
+            - -apitoken=$(API_TOKEN)
+          ports:
+            - name: http-api
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
           env:
             - name: DB_HOST
               valueFrom:
@@ -92,6 +112,11 @@ spec:
                 secretKeyRef:
                   name: market-bot-secret
                   key: DB_PASS
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: market-bot-secret
+                  key: API_TOKEN
             - name: DB_NAME
               valueFrom:
                 configMapKeyRef:
@@ -144,3 +169,19 @@ spec:
           hostPath:
             path: /opt/market-bot/cache
             type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-bot
+  namespace: dune-market-bot
+spec:
+  selector:
+    app: market-bot
+  ports:
+    - name: http-api
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+  type: ClusterIP

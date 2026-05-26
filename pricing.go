@@ -325,8 +325,8 @@ func CategoryMask(category string, idx [4][]string) (mask int32, depth int16) {
 // When vendor_price is available (nearly all items), market price = vendor_price * multiplier.
 // The multiplier accounts for rarity and convenience over NPC vendors.
 // Falls back to tier+stack-based pricing for the few items without a vendor price.
-func computePrice(item CatalogItem) int64 {
-	return roundPrice(basePrice(item))
+func computePrice(item CatalogItem, snap configValues) int64 {
+	return roundPrice(basePrice(item, snap))
 }
 
 // minMeaningfulVendorPrice is the threshold below which vendor_price is treated as a
@@ -335,20 +335,20 @@ func computePrice(item CatalogItem) int64 {
 const minMeaningfulVendorPrice = 10
 
 // basePrice returns the unrounded base price, shared by computePrice and adjustPrice.
-func basePrice(item CatalogItem) int64 {
+func basePrice(item CatalogItem, snap configValues) int64 {
 	// Unique/memento equipment with a known crafting cost: price as
 	// schematic_equivalent + material_cost * 0.75.
 	if item.MaterialCost > 0 && item.StackMax <= 1 && !item.IsSchematic &&
 		(strings.ToLower(item.Rarity) == "unique" || strings.ToLower(item.Rarity) == "memento") {
-		schemPrice := float64(schematicEquipmentPrice(item.Tier)) * rarityMult(item.Rarity)
+		schemPrice := float64(schematicEquipmentPrice(item.Tier)) * rarityMult(item.Rarity, snap.RarityMultipliers)
 		return int64(math.Round(schemPrice + float64(materialCostForGrade(item, 0))*0.75))
 	}
 	if item.BasePrice >= minMeaningfulVendorPrice {
-		mult := vendorMult(item.Rarity)
+		mult := vendorMult(item.Rarity, snap.VendorMultipliers)
 		return int64(math.Round(float64(item.BasePrice) * mult))
 	}
 	// Fallback for items without a vendor price.
-	mult := rarityMult(item.Rarity)
+	mult := rarityMult(item.Rarity, snap.RarityMultipliers)
 	if item.StackMax <= 1 {
 		base := equipmentPrice(item.Tier)
 		if item.IsSchematic {
@@ -363,19 +363,16 @@ func basePrice(item CatalogItem) int64 {
 	return p
 }
 
-// vendorMult is the market price multiplier applied to the NPC vendor base price.
-// BaseBuyFromVendorPrice is the NPC sell price; observed market prices run ~2.875×
-// that value across multiple item types, so 3.0 is used as the common multiplier.
-// Unique/Memento at higher multiples since they're rarer on the open market.
-func vendorMult(rarity string) float64 {
-	switch strings.ToLower(rarity) {
-	case "unique":
-		return 3.0
-	case "memento":
-		return 5.0
-	default: // Common
-		return 3.0
+// vendorMult returns the market price multiplier for the NPC vendor base price.
+// Looks up rarity (case-insensitive) in the provided multiplier map; defaults to 1.0.
+func vendorMult(rarity string, mult map[string]float64) float64 {
+	lower := strings.ToLower(rarity)
+	for k, v := range mult {
+		if strings.ToLower(k) == lower {
+			return v
+		}
 	}
+	return 1.0
 }
 
 // equipmentPrice is the per-item price for non-stackable physical gear (StackMax=1).
@@ -441,19 +438,18 @@ func materialUnitPrice(tier int) int64 {
 	}
 }
 
-func rarityMult(rarity string) float64 {
-	switch strings.ToLower(rarity) {
-	case "unique":
-		return 3.0
-	case "memento":
-		return 5.0
-	default: // Common, empty
-		return 1.0
+func rarityMult(rarity string, mult map[string]float64) float64 {
+	lower := strings.ToLower(rarity)
+	for k, v := range mult {
+		if strings.ToLower(k) == lower {
+			return v
+		}
 	}
+	return 1.0
 }
 
-func adjustPrice(item CatalogItem, currentPrice int64, soldFraction float64) int64 {
-	floor := roundPrice(basePrice(item))
+func adjustPrice(item CatalogItem, currentPrice int64, soldFraction float64, snap configValues) int64 {
+	floor := roundPrice(basePrice(item, snap))
 	ceiling := floor * 5
 
 	// Hard per-item overrides from item-data.json take precedence.
@@ -484,21 +480,17 @@ func adjustPrice(item CatalogItem, currentPrice int64, soldFraction float64) int
 	return next
 }
 
-// gradePriceMult returns the price multiplier for quality grades 1–5.
-// Grade 0 (no grade — stackables, schematics) returns 1.0.
-// Calibrated against in-game stat scaling: G1=1.0× baseline, G5≈2.0× (empirical range 1.5–2.2×).
-var gradePriceMultTable = [6]float64{1.0, 1.0, 1.25, 1.5, 1.75, 2.0}
-
-func gradePriceMult(grade int64) float64 {
+// gradePriceMult returns the price multiplier for quality grades 0–5 from the config array.
+func gradePriceMult(grade int64, mults [6]float64) float64 {
 	if grade < 0 || grade > 5 {
 		return 1.0
 	}
-	return gradePriceMultTable[grade]
+	return mults[grade]
 }
 
 // gradedPrice returns the grade-adjusted listing price, rounded to a clean step.
-func gradedPrice(basePrice int64, grade int64) int64 {
-	return roundPrice(int64(math.Round(float64(basePrice) * gradePriceMult(grade))))
+func gradedPrice(basePrice int64, grade int64, mults [6]float64) int64 {
+	return roundPrice(int64(math.Round(float64(basePrice) * gradePriceMult(grade, mults))))
 }
 
 // materialCostForGrade returns the recipe material cost for a specific grade.
@@ -513,14 +505,14 @@ func materialCostForGrade(item CatalogItem, grade int64) int64 {
 // gradeFloor returns the listing price floor for item at the given grade.
 // For unique/memento equipment with crafting recipes, each grade's price is derived
 // from that grade's actual material cost rather than a flat multiplier.
-func gradeFloor(item CatalogItem, grade int64) int64 {
+func gradeFloor(item CatalogItem, grade int64, snap configValues) int64 {
 	if item.MaterialCost > 0 && item.StackMax <= 1 && !item.IsSchematic &&
 		(strings.ToLower(item.Rarity) == "unique" || strings.ToLower(item.Rarity) == "memento") {
 		mc := materialCostForGrade(item, grade)
-		schemPrice := float64(schematicEquipmentPrice(item.Tier)) * rarityMult(item.Rarity)
+		schemPrice := float64(schematicEquipmentPrice(item.Tier)) * rarityMult(item.Rarity, snap.RarityMultipliers)
 		return roundPrice(int64(math.Round(schemPrice + float64(mc)*0.75)))
 	}
-	return gradedPrice(roundPrice(basePrice(item)), grade)
+	return gradedPrice(roundPrice(basePrice(item, snap)), grade, snap.GradeMultipliers)
 }
 
 // roundPrice rounds to a magnitude-appropriate step so prices look clean.

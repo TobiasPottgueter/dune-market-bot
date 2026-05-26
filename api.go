@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -41,11 +42,12 @@ func (s *APIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.token == "" {
-			next(w, r)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		hdr := r.Header.Get("Authorization")
-		if !strings.HasPrefix(hdr, "Bearer ") || strings.TrimPrefix(hdr, "Bearer ") != s.token {
+		tok := strings.TrimPrefix(hdr, "Bearer ")
+		if !strings.HasPrefix(hdr, "Bearer ") || subtle.ConstantTimeCompare([]byte(tok), []byte(s.token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -56,7 +58,9 @@ func (s *APIServer) auth(next http.HandlerFunc) http.HandlerFunc {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("api: writeJSON encode error: %v", err)
+	}
 }
 
 func (s *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -68,9 +72,7 @@ func (s *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *APIServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(s.config)
+	writeJSON(w, http.StatusOK, s.config)
 }
 
 func (s *APIServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +99,17 @@ func (s *APIServer) handleReport(w http.ResponseWriter, r *http.Request) {
 
 // ListenAndServe starts the HTTP server on addr. Blocks until the server stops.
 func (s *APIServer) ListenAndServe(addr string) {
-	srv := &http.Server{Addr: addr, Handler: s}
+	if s.token == "" {
+		log.Printf("api: WARNING: no API token configured — all authenticated endpoints are disabled")
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("api: listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Printf("api: %v", err)

@@ -21,19 +21,14 @@ var (
 	flagDBPass       = flag.String("dbpass", "dune", "PostgreSQL password")
 	flagDBName       = flag.String("dbname", "dune", "PostgreSQL database")
 	flagCacheDB      = flag.String("cachedb", "/data/market-bot-cache.db", "SQLite path for category cache")
-	flagBuyInterval  = flag.Duration("buyinterval", 5*time.Minute, "how often to buy player listings")
-	flagListInterval = flag.Duration("listinterval", 30*time.Minute, "how often to restock/prune bot listings")
+	flagBuyInterval  = flag.Duration("buyinterval", 5*time.Minute, "initial buy tick interval")
+	flagListInterval = flag.Duration("listinterval", 30*time.Minute, "initial list tick interval")
 	flagBuyThreshold = flag.Float64("buythreshold", 1.05, "buy player listings at or below this multiple of the bot's sell price (0 = disable buying)")
 	flagMaxBuys      = flag.Int("maxbuys", 50, "max player listings to purchase per tick")
 	flagReport       = flag.Bool("report", false, "print per-item sales analytics as TSV and exit (does not run the bot loop)")
+	flagAPIAddr      = flag.String("apiaddr", ":8081", "HTTP API listen address (empty to disable)")
+	flagAPIToken     = flag.String("apitoken", "", "Bearer token for HTTP API auth")
 )
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func main() {
 	flag.Parse()
@@ -74,6 +69,12 @@ func main() {
 	}
 	log.Printf("connected to %s:%d/%s", *flagDBHost, *flagDBPort, *flagDBName)
 
+	cfg := &Config{config: defaultConfig()}
+	cfg.config.BuyInterval = *flagBuyInterval
+	cfg.config.ListInterval = *flagListInterval
+	cfg.config.BuyThreshold = *flagBuyThreshold
+	cfg.config.MaxBuys = *flagMaxBuys
+
 	log.Println("loading catalog...")
 	catalog, err := loadCatalog()
 	if err != nil {
@@ -81,12 +82,10 @@ func main() {
 	}
 	log.Printf("catalog: %d listable items", len(catalog))
 
-	ex, err := NewExchange(pool, *flagCacheDB, catalog)
+	ex, err := NewExchange(pool, *flagCacheDB, catalog, cfg)
 	if err != nil {
 		log.Fatalf("init exchange: %v", err)
 	}
-	ex.buyThreshold = *flagBuyThreshold
-	ex.maxBuys = *flagMaxBuys
 
 	log.Println("initializing exchange...")
 	if err := ex.Init(ctx, catalog); err != nil {
@@ -94,32 +93,43 @@ func main() {
 	}
 	log.Println("exchange ready")
 
+	if *flagAPIAddr != "" {
+		api := newAPIServer(cfg, ex, *flagAPIToken)
+		go api.ListenAndServe(*flagAPIAddr)
+	}
+
 	// Report mode: print analytics and exit without running the bot loop.
 	if *flagReport {
 		runReport(ctx, pool, ex, catalog)
 		return
 	}
 
-	// Run both immediately on start.
+	// Run both ticks immediately on start.
 	ex.Tick(ctx, catalog)
 
-	tick := time.NewTicker(minDuration(*flagBuyInterval, *flagListInterval))
+	// Poll every minute; read intervals from live config so API changes take effect promptly.
+	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
-	nextBuy := time.Now().Add(*flagBuyInterval)
-	nextList := time.Now().Add(*flagListInterval)
+	snap0 := cfg.Snapshot()
+	nextBuy := time.Now().Add(snap0.BuyInterval)
+	nextList := time.Now().Add(snap0.ListInterval)
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("shutting down (signal received)")
 			return
 		case now := <-tick.C:
+			snap := cfg.Snapshot()
+			if !snap.Enabled {
+				continue
+			}
 			if now.After(nextBuy) {
 				ex.BuyTick(ctx)
-				nextBuy = now.Add(*flagBuyInterval)
+				nextBuy = now.Add(snap.BuyInterval)
 			}
 			if now.After(nextList) {
 				ex.ListTick(ctx, catalog)
-				nextList = now.Add(*flagListInterval)
+				nextList = now.Add(snap.ListInterval)
 			}
 		}
 	}

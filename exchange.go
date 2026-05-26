@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,10 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const (
-	listingsPerGrade = 5
-	orderExpirySecs  = int64(24 * 3600)
-)
+const orderExpirySecs = int64(24 * 3600)
 
 // statusSnap is returned by GET /status.
 type statusSnap struct {
@@ -29,10 +27,21 @@ type statusSnap struct {
 }
 
 func (e *Exchange) statusSnapshot(start time.Time) statusSnap {
+	lastBuy := "never"
+	if ns := e.lastBuyNano.Load(); ns > 0 {
+		lastBuy = time.Unix(0, ns).UTC().Format(time.RFC3339)
+	}
+	lastList := "never"
+	if ns := e.lastListNano.Load(); ns > 0 {
+		lastList = time.Unix(0, ns).UTC().Format(time.RFC3339)
+	}
 	return statusSnap{
 		Uptime:       time.Since(start).Round(time.Second).String(),
-		LastBuyTick:  "never",
-		LastListTick: "never",
+		LastBuyTick:  lastBuy,
+		LastListTick: lastList,
+		ListingCount: e.listingCount.Load(),
+		Balance:      e.solariBalance.Load(),
+		ErrorCount:   e.errCount.Load(),
 	}
 }
 
@@ -77,6 +86,7 @@ type listingInfo struct {
 type Exchange struct {
 	db            *pgxpool.Pool
 	cache         *sql.DB // local SQLite category cache
+	cfg           *Config
 	segIdx        [4][]string
 	botInvID      int64
 	ownerID       int64 // actor ID of the market bot (Revy)
@@ -88,8 +98,13 @@ type Exchange struct {
 	catalogMap    map[string]CatalogItem // template_id → catalog entry (for buyable check)
 	gameEpochUnix int64                  // unix timestamp of the game server's time epoch; 0 = unknown
 	nextPos       int64                  // position_index counter for item inserts
-	buyThreshold  float64
-	maxBuys       int
+
+	// atomic counters — updated by BuyTick/ListTick, read by statusSnapshot.
+	lastBuyNano   atomic.Int64 // UnixNano of last buy tick; 0 = never
+	lastListNano  atomic.Int64 // UnixNano of last list tick; 0 = never
+	listingCount  atomic.Int64 // current bot listing count
+	errCount      atomic.Int64 // cumulative errors since process start
+	solariBalance atomic.Int64 // Solari balance as of last list tick
 }
 
 // marketPrice holds real market stats from dune_exchange_get_item_price_stats.
@@ -98,7 +113,7 @@ type marketPrice struct {
 	average int64
 }
 
-func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Exchange, error) {
+func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem, cfg *Config) (*Exchange, error) {
 	cache, err := sql.Open("sqlite", cachePath)
 	if err != nil {
 		return nil, fmt.Errorf("open category cache %s: %w", cachePath, err)
@@ -122,6 +137,7 @@ func NewExchange(db *pgxpool.Pool, cachePath string, catalog []CatalogItem) (*Ex
 	ex := &Exchange{
 		db:         db,
 		cache:      cache,
+		cfg:        cfg,
 		segIdx:     buildSegmentIndex(catalog),
 		prices:     make(map[string]int64),
 		categories: make(map[string]categoryEntry),
@@ -359,8 +375,8 @@ func (e *Exchange) categoryFor(item CatalogItem) (mask int32, depth int16) {
 	return 0, 0
 }
 
-func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
-	if e.buyThreshold <= 0 {
+func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64, snap configValues) {
+	if snap.BuyThreshold <= 0 {
 		return
 	}
 	if orderExpiry <= 0 {
@@ -378,7 +394,7 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 		JOIN dune.dune_exchange_sell_orders s ON s.order_id = o.id
 		LEFT JOIN dune.items i ON i.id = o.item_id
 		WHERE o.is_npc_order = FALSE AND o.exchange_id = $1
-		LIMIT $2`, e.exchangeID, e.maxBuys*10)
+		LIMIT $2`, e.exchangeID, snap.MaxBuys*10)
 	if err != nil {
 		log.Printf("buy: query: %v", err)
 		return
@@ -388,7 +404,7 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 	purchased, skippedPrice, skippedUnknown, errs := 0, 0, 0, 0
 
 	for rows.Next() {
-		if purchased >= e.maxBuys {
+		if purchased >= snap.MaxBuys {
 			break
 		}
 
@@ -411,9 +427,9 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 			continue
 		}
 
-		refPrice := gradedPrice(botPrice, grade)
-		if price > int64(float64(refPrice)*e.buyThreshold) {
-			log.Printf("buy: skip %s price=%d ref=%d(grade%d) threshold=%.2f", tmpl, price, refPrice, grade, e.buyThreshold)
+		refPrice := gradedPrice(botPrice, grade, snap.GradeMultipliers)
+		if price > int64(float64(refPrice)*snap.BuyThreshold) {
+			log.Printf("buy: skip %s price=%d ref=%d(grade%d) threshold=%.2f", tmpl, price, refPrice, grade, snap.BuyThreshold)
 			skippedPrice++
 			continue
 		}
@@ -486,6 +502,9 @@ func (e *Exchange) buyPlayerListings(ctx context.Context, orderExpiry int64) {
 		purchased++
 	}
 
+	if errs > 0 {
+		e.errCount.Add(int64(errs))
+	}
 	if purchased+errs+skippedPrice+skippedUnknown > 0 {
 		log.Printf("buy: %d purchased, %d skipped-price, %d skipped-unknown, %d errors",
 			purchased, skippedPrice, skippedUnknown, errs)
@@ -503,7 +522,7 @@ type pendingListing struct {
 
 // createListingsBatch inserts up to batchSize listings per transaction.
 // Returns (created, errors).
-func (e *Exchange) createListingsBatch(ctx context.Context, listings []pendingListing) (int, int) {
+func (e *Exchange) createListingsBatch(ctx context.Context, listings []pendingListing, snap configValues) (int, int) {
 	const batchSize = 100
 	created, errs := 0, 0
 	for i := 0; i < len(listings); i += batchSize {
@@ -522,9 +541,9 @@ func (e *Exchange) createListingsBatch(ctx context.Context, listings []pendingLi
 		for _, pl := range batch {
 			catMask, catDepth := e.categoryFor(pl.item)
 			qualityLevel := pl.grade
-			listPrice := gradeFloor(pl.item, pl.grade)
+			listPrice := gradeFloor(pl.item, pl.grade, snap)
 			if pl.item.MaterialCost <= 0 {
-				listPrice = gradedPrice(pl.basePrice, pl.grade)
+				listPrice = gradedPrice(pl.basePrice, pl.grade, snap.GradeMultipliers)
 			}
 			var itemID int64
 			if err := tx.QueryRow(ctx, `
@@ -573,7 +592,7 @@ func (e *Exchange) createListingsBatch(ctx context.Context, listings []pendingLi
 }
 
 // createListing inserts one sell order + its item directly into the DB at the given grade.
-func (e *Exchange) createListing(ctx context.Context, item CatalogItem, basePrice, stackMax, expiry, grade int64) error {
+func (e *Exchange) createListing(ctx context.Context, item CatalogItem, basePrice, stackMax, expiry, grade int64, snap configValues) error {
 	catMask, catDepth := e.categoryFor(item)
 
 	tx, err := e.db.Begin(ctx)
@@ -583,9 +602,9 @@ func (e *Exchange) createListing(ctx context.Context, item CatalogItem, basePric
 	defer tx.Rollback(ctx)
 
 	qualityLevel := grade
-	listPrice := gradeFloor(item, grade)
+	listPrice := gradeFloor(item, grade, snap)
 	if item.MaterialCost <= 0 {
-		listPrice = gradedPrice(basePrice, grade)
+		listPrice = gradedPrice(basePrice, grade, snap.GradeMultipliers)
 	}
 
 	// Item goes directly into the exchange inventory.
@@ -625,6 +644,8 @@ func (e *Exchange) createListing(ctx context.Context, item CatalogItem, basePric
 func (e *Exchange) BuyTick(ctx context.Context) {
 	e.learnGameEpoch(ctx)
 
+	snap := e.cfg.Snapshot()
+
 	gameNow := e.gameNow()
 	var orderExpiry int64
 	if gameNow > 0 {
@@ -633,16 +654,19 @@ func (e *Exchange) BuyTick(ctx context.Context) {
 		orderExpiry = 999_999_999
 	}
 
-	e.buyPlayerListings(ctx, orderExpiry)
+	e.buyPlayerListings(ctx, orderExpiry, snap)
+	e.lastBuyNano.Store(time.Now().UnixNano())
 }
 
 // ListTick runs the listing/pruning operations: refresh caches, update prices,
 // prune stale listings, top up depleted stacks, and create new listings.
 func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
+	snap := e.cfg.Snapshot()
+
 	e.learnGameEpoch(ctx)
 	e.refreshCategoryCache(ctx)
 	e.fetchMarketPrices(ctx, catalog) // fetch real market prices via proc
-	e.updatePrices(ctx, catalog)
+	e.updatePrices(ctx, catalog, snap)
 	e.expireAndPurgeOrders(ctx) // use server procs for expiration
 
 	gameNow := e.gameNow()
@@ -697,9 +721,9 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 		}
 
 		for _, grade := range applicableGrades(item) {
-			price := gradeFloor(item, grade)
+			price := gradeFloor(item, grade, snap)
 			if item.MaterialCost <= 0 {
-				price = gradedPrice(basePrice, grade)
+				price = gradedPrice(basePrice, grade, snap.GradeMultipliers)
 			}
 			key := gradeKey{item.TemplateID, grade}
 			listings := current[key]
@@ -724,8 +748,8 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 				}
 			}
 
-			// Accumulate listings to create to reach listingsPerGrade.
-			for i := len(valid); i < listingsPerGrade; i++ {
+			// Accumulate listings to create to reach the configured quota per grade.
+			for i := len(valid); i < snap.ListingsPerGrade; i++ {
 				pending = append(pending, pendingListing{
 					item:      item,
 					basePrice: basePrice,
@@ -759,12 +783,24 @@ func (e *Exchange) ListTick(ctx context.Context, catalog []CatalogItem) {
 
 	// Batch insert new listings.
 	if len(pending) > 0 {
-		c, e2 := e.createListingsBatch(ctx, pending)
+		c, e2 := e.createListingsBatch(ctx, pending, snap)
 		created += c
 		errs += e2
 	}
 
 	log.Printf("list-tick: %d created, %d topped up, %d pruned, %d errors", created, topped, pruned, errs)
+
+	e.lastListNano.Store(time.Now().UnixNano())
+	if errs > 0 {
+		e.errCount.Add(int64(errs))
+	}
+
+	// Refresh balance and listing count for /status endpoint.
+	var balance, count int64
+	_ = e.db.QueryRow(ctx, `SELECT dune.dune_exchange_retrieve_solari_balance($1)`, e.ownerID).Scan(&balance)
+	_ = e.db.QueryRow(ctx, `SELECT COUNT(*) FROM dune.dune_exchange_orders WHERE owner_id = $1 AND is_npc_order = TRUE`, e.ownerID).Scan(&count)
+	e.solariBalance.Store(balance)
+	e.listingCount.Store(count)
 }
 
 // Tick runs both BuyTick and ListTick. Used for the initial run on startup.
@@ -773,7 +809,7 @@ func (e *Exchange) Tick(ctx context.Context, catalog []CatalogItem) {
 	e.ListTick(ctx, catalog)
 }
 
-func (e *Exchange) updatePrices(ctx context.Context, catalog []CatalogItem) {
+func (e *Exchange) updatePrices(ctx context.Context, catalog []CatalogItem, snap configValues) {
 	catalogMap := make(map[string]CatalogItem, len(catalog))
 	for _, item := range catalog {
 		catalogMap[item.TemplateID] = item
@@ -812,7 +848,7 @@ func (e *Exchange) updatePrices(ctx context.Context, catalog []CatalogItem) {
 		if listed > 0 {
 			frac = float64(sold) / float64(listed)
 		}
-		adjusted := adjustPrice(item, current, frac)
+		adjusted := adjustPrice(item, current, frac, snap)
 
 		// Factor in real market prices: if players are undercutting us significantly,
 		// consider lowering our price toward the market minimum.

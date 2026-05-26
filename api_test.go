@@ -6,14 +6,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func newTestServer(t *testing.T) (*APIServer, *Config) {
 	t.Helper()
 	cfg := &Config{}
 	cfg.config = defaultConfig()
-	ex := &Exchange{} // zero value is fine for handler tests
+	ex := &Exchange{}
 	srv := newAPIServer(cfg, ex, "test-token")
 	return srv, cfg
 }
@@ -105,5 +104,27 @@ func TestConfigReload(t *testing.T) {
 	}
 }
 
-// Compile-time check: ensure time import is used (startTime field uses time.Time).
-var _ = time.Now
+func TestReport(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest("GET", "/report", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("want 200 got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNoTokenRejectsAll(t *testing.T) {
+	cfg := &Config{}
+	cfg.config = defaultConfig()
+	srv := newAPIServer(cfg, &Exchange{}, "")
+	for _, path := range []string{"/status", "/config", "/report"} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s with no token: want 401 got %d", path, w.Code)
+		}
+	}
+}
