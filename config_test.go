@@ -84,6 +84,27 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestConfigMultiplierValidation(t *testing.T) {
+	c := &Config{}
+	c.config = defaultConfig()
+
+	// Zero grade multiplier should be rejected
+	patch := map[string]json.RawMessage{}
+	b, _ := json.Marshal([6]float64{1.0, 0.0, 1.25, 1.5, 1.75, 2.0})
+	patch["grade_multipliers"] = b
+	if err := c.Apply(patch); err == nil {
+		t.Error("expected error for zero grade multiplier")
+	}
+
+	// Negative rarity multiplier should be rejected
+	patch2 := map[string]json.RawMessage{}
+	b2, _ := json.Marshal(map[string]float64{"common": -1.0})
+	patch2["rarity_multipliers"] = b2
+	if err := c.Apply(patch2); err == nil {
+		t.Error("expected error for negative rarity multiplier")
+	}
+}
+
 func TestConfigValidationAtomicity(t *testing.T) {
 	c := &Config{}
 	c.config = defaultConfig()

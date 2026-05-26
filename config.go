@@ -175,17 +175,38 @@ func (c *Config) Apply(patch map[string]json.RawMessage) error {
 				return fmt.Errorf("enabled: %w", err)
 			}
 		case "grade_multipliers":
-			if err := json.Unmarshal(raw, &next.GradeMultipliers); err != nil {
+			var tmp [6]float64
+			if err := json.Unmarshal(raw, &tmp); err != nil {
 				return fmt.Errorf("grade_multipliers: %w", err)
 			}
+			for i, v := range tmp {
+				if v <= 0 {
+					return fmt.Errorf("grade_multipliers[%d]: must be > 0", i)
+				}
+			}
+			next.GradeMultipliers = tmp
 		case "rarity_multipliers":
-			if err := json.Unmarshal(raw, &next.RarityMultipliers); err != nil {
+			var tmp map[string]float64
+			if err := json.Unmarshal(raw, &tmp); err != nil {
 				return fmt.Errorf("rarity_multipliers: %w", err)
 			}
+			for k, v := range tmp {
+				if v <= 0 {
+					return fmt.Errorf("rarity_multipliers[%q]: must be > 0", k)
+				}
+			}
+			next.RarityMultipliers = tmp
 		case "vendor_multipliers":
-			if err := json.Unmarshal(raw, &next.VendorMultipliers); err != nil {
+			var tmp map[string]float64
+			if err := json.Unmarshal(raw, &tmp); err != nil {
 				return fmt.Errorf("vendor_multipliers: %w", err)
 			}
+			for k, v := range tmp {
+				if v <= 0 {
+					return fmt.Errorf("vendor_multipliers[%q]: must be > 0", k)
+				}
+			}
+			next.VendorMultipliers = tmp
 		case "disabled_items":
 			if err := json.Unmarshal(raw, &next.DisabledItems); err != nil {
 				return fmt.Errorf("disabled_items: %w", err)
